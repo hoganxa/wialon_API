@@ -1,0 +1,308 @@
+import pymysql
+import pandas as pd
+import requests
+import json
+import os
+import logging
+import re
+from difflib import SequenceMatcher
+from datetime import datetime
+
+# --- [ USER CONFIGURATION] ---
+#
+# !! EDIT BELOW !!
+#
+DB_HOST = 'XXXXX' 
+DB_USER = 'XXXXX'  
+DB_PASSWORD = 'XXXXX'  
+DB_NAME = 'XXXXX'
+
+WIALON_API_URL = 'https://hst-api.wialon.com/wialon/ajax.html'
+API_TOKEN = 'TOKEN NUMBER HERE'
+# --- Pengaturan Folder Output ---
+BASE_DIR = r"G:\Reports\106_Route_Earnings"
+CSV_FILENAME = "to check.csv"
+LOG_FILENAME = "logs.txt"
+
+CSV_PATH = os.path.join(BASE_DIR, CSV_FILENAME)
+LOG_PATH = os.path.join(BASE_DIR, LOG_FILENAME)
+
+# --- [ AKHIR KONFIGURASI ] ---
+
+# --- FUNGSI SETUP LOGGING ---
+def setup_logging():
+    if not os.path.exists(BASE_DIR):
+        try: os.makedirs(BASE_DIR)
+        except OSError as e: print(f"CRITICAL: Gagal membuat folder {BASE_DIR}: {e}"); return None
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers(): logger.handlers.clear()
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    try:
+        fh = logging.FileHandler(LOG_PATH, encoding='utf-8'); fh.setFormatter(formatter); logger.addHandler(fh)
+    except: pass
+    sh = logging.StreamHandler(); sh.setFormatter(formatter); logger.addHandler(sh)
+    return logger
+
+# --- FUNGSI UTILITIES ---
+def format_timestamp(ts):
+    """Mengubah Unix timestamp menjadi string waktu."""
+    if not ts: return None
+    return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+
+def wialon_request(svc, params, sid=None):
+    data = {'svc': svc, 'params': json.dumps(params)}
+    if sid: data['sid'] = sid
+    try:
+        response = requests.post(WIALON_API_URL, data=data, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e: return {"error": str(e)}
+
+# --- FUNGSI IDENTIFIKASI KENDARAAN ---
+def extract_identity(car_name):
+    if not car_name: return None, None
+    clean_name = re.sub(r'\(.*?\)', '', str(car_name)) 
+    clean_name = clean_name.replace('-', ' ').replace('.', ' ')
+    parts = clean_name.lower().split()
+    if len(parts) >= 2: brand_prefix = f"{parts[0]}{parts[1]}"
+    elif len(parts) == 1: brand_prefix = parts[0]
+    else: return None, None
+    match = re.search(r'([a-z]{2})\s*([\d\s]*\d)', clean_name.lower())
+    reg_number = None
+    if match:
+        full_plate = match.group(1) + match.group(2)
+        reg_number = full_plate.replace(' ', '')
+    return brand_prefix, reg_number
+
+def find_match_by_identity(db_car_name, wialon_name_map):
+    db_brand, db_reg = extract_identity(db_car_name)
+    if not db_brand or not db_reg: return None, None, "Identity Extract Failed"
+    for wialon_name, unit_id in wialon_name_map.items():
+        w_brand, w_reg = extract_identity(wialon_name)
+        if not w_brand or not w_reg: continue
+        if db_brand == w_brand and db_reg == w_reg:
+            return unit_id, wialon_name, "Identity Match (Brand+Reg)"
+    return None, None, "No Match"
+
+# --- FUNGSI DATABASE ---
+def get_route_data_from_db(logger):
+    sql_query = """
+    SELECT 
+        r.id AS route_id, 
+        r.deleted,
+        r.name AS route_name, 
+        c.name AS car_name, 
+        r.start_warehouse_id,
+        r.start_date,
+        r.driver_amt AS driver_amount,
+        rd.driver_username, 
+        rd.is_helper, 
+        e.name AS driver_name, 
+        e.name2 AS driver_name2,
+        w.name AS warehouse_name,
+        c.id AS car_id,
+        c.wialon_tracking_imei
+    FROM 
+        route r
+    LEFT JOIN 
+        route_driver rd ON r.id = rd.route_id
+    LEFT JOIN 
+        employee e ON rd.driver_username = e.username 
+    LEFT JOIN 
+        warehouse w ON r.start_warehouse_id = w.warehouse_id
+    LEFT JOIN 
+        cars c ON r.car_id = c.id
+    WHERE
+        c.wialon_tracking_imei IS NOT NULL
+    AND r.start_date BETWEEN '2025-09-16' AND '2025-11-30';
+    """
+    logger.info("Mengambil data rute dari database MySQL...")
+    try:
+        connection = pymysql.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(sql_query)
+            result = cursor.fetchall()
+        connection.close()
+        logger.info(f"Selesai ({len(result)} rute).")
+        return pd.DataFrame(result)
+    except Exception as e:
+        logger.error(f"Database Error: {e}")
+        return pd.DataFrame()
+
+def build_wialon_name_map(sid, logger):
+    logger.info("Membangun peta Nama Unit Wialon...")
+    name_map = {}
+    params = {"spec": {"itemsType": "avl_unit", "propName": "sys_name", "propValueMask": "*", "sortType": "sys_name"}, "force": 1, "flags": 1, "from": 0, "to": 0}
+    resp = wialon_request("core/search_items", params, sid)
+    if 'items' in resp:
+        for unit in resp['items']:
+            if unit.get('nm'): name_map[unit['nm']] = unit['id']
+        return name_map
+    else:
+        logger.error("Gagal ambil unit Wialon.")
+        return None
+
+# --- MAIN LOGIC ---
+def main():
+    logger = setup_logging()
+    if not logger: return
+
+    # 1. Login
+    login = wialon_request("token/login", {"token": API_TOKEN})
+    if 'eid' not in login: 
+        logger.critical(f"Login Gagal: {login}")
+        return
+    sid = login['eid']
+
+    # 2. Prepare Data
+    name_map = build_wialon_name_map(sid, logger)
+    if not name_map: return
+    
+    route_df = get_route_data_from_db(logger)
+    if route_df.empty: 
+        logger.warning("No route data found in the database.")
+        return
+
+    logger.info(f"Memproses data dan menyusun CSV ({CSV_FILENAME})...")
+
+    csv_data = []
+
+    for index, route in route_df.iterrows():
+        # Siapkan data dasar dari DB
+        result_base = {
+            "route_id": route['route_id'],
+            "route_name": route['route_name'],
+            "car_name": route['car_name'],
+            "date": None,
+            "driver_amount": route['driver_amount'],
+            "driver_username": route['driver_username'],
+            "is_helper": route['is_helper'],
+            "driver_name": route['driver_name'],
+            "driver_name2": route['driver_name2'],
+            "warehouse_name": route['warehouse_name'],
+            "car_id": route['car_id'],
+            "tracking_imei": route['wialon_tracking_imei'],
+            "start_time": None,
+            "end_time": None,
+            "data_source": "No Data"
+        }
+
+        car_name = route['car_name']
+        date_obj = route['start_date']
+
+        # A. Pencocokan Unit
+        unit_id, matched_name, match_type = find_match_by_identity(car_name, name_map)
+        
+        if not unit_id:
+            result_base['data_source'] = f"Unit Not Found (Car: {car_name})"
+            csv_data.append(result_base)
+            continue
+
+        # B. Validasi Tanggal
+        try:
+            if not isinstance(date_obj, datetime): date_obj = pd.to_datetime(date_obj)
+            t_from = int(date_obj.replace(hour=0, minute=0, second=0).timestamp())
+            t_to = int(date_obj.replace(hour=23, minute=59, second=59).timestamp())
+            result_base['date'] = date_obj.strftime('%Y-%m-%d')
+        except:
+            result_base['data_source'] = "Date Error"
+            csv_data.append(result_base)
+            continue
+
+        # TASK 1: Load Messages
+        msg_params = {"itemId": unit_id, "timeFrom": t_from, "timeTo": t_to, "flags": 0, "flagsMask": 0, "loadCount": 4294967295}
+        raw_msgs_resp = wialon_request("messages/load_interval", msg_params, sid)
+        if 'error' in raw_msgs_resp:
+            result_base['data_source'] = f"Wialon Error: {raw_msgs_resp['error']}"
+            csv_data.append(result_base)
+            continue
+
+        # TASK 2: Get Trips
+        trips_params = {"itemId": unit_id, "msgsSource": "1", "timeFrom": t_from, "timeTo": t_to}
+        trips_resp = wialon_request("unit/get_trips", trips_params, sid)
+
+        trips_list = []
+        if isinstance(trips_resp, list): trips_list = trips_resp
+        elif isinstance(trips_resp, dict): trips_list = trips_resp.get('trips', [])
+
+        if trips_list:
+            result_base['data_source'] = []
+            for i, trip in enumerate(trips_list):
+                start_raw = trip.get('from', {}).get('t')
+                end_raw = trip.get('to', {}).get('t')
+                result_base['start_time'] = format_timestamp(start_raw)
+                result_base['end_time'] = format_timestamp(end_raw)
+                result_base['data_source'].append(f"Trip {i+1}: {result_base['start_time']} -> {result_base['end_time']}")
+        elif raw_msgs_resp.get('count', 0) > 0:
+            msgs = raw_msgs_resp.get('messages', [])
+            if msgs:
+                result_base['start_time'] = format_timestamp(msgs[0].get('t'))
+                result_base['end_time'] = format_timestamp(msgs[-1].get('t'))
+                result_base['data_source'] = f"Raw GPS ({raw_msgs_resp.get('count')}) ({match_type})"
+        else:
+            result_base['data_source'] = f"No GPS Activity ({match_type})"
+
+        csv_data.append(result_base)
+
+    # --- Save CSV (APPEND MODE LOGIC) ---
+    if csv_data:
+        # 1. Buat DataFrame dari data BARU
+        df_new = pd.DataFrame(csv_data)
+        
+        # Definisi kolom output
+        cols = [
+            "route_id", "route_name", "car_name", "date", "driver_amount", 
+            "driver_username", "is_helper", "driver_name", "driver_name2", 
+            "warehouse_name", "car_id", "tracking_imei", 
+            "start_time", "end_time", "data_source"
+        ]
+        
+        # Filter kolom agar sesuai
+        final_cols = [c for c in cols if c in df_new.columns]
+        df_new = df_new[final_cols]
+
+        try:
+            # 2. Cek apakah file sudah ada
+            if os.path.exists(CSV_PATH):
+                logger.info(f"File '{CSV_FILENAME}' ditemukan. Menggabungkan data baru...")
+                
+                # 3. Baca file lama
+                df_existing = pd.read_csv(CSV_PATH)
+                
+                # 4. Gabungkan data lama dan baru
+                df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+                
+                # 5. Hapus duplikat (Untuk mencegah data ganda jika script dijalankan ulang untuk hari yang sama)
+                # Kita anggap 'route_id' dan 'date' sebagai kunci unik
+                before_dedup = len(df_combined)
+                df_combined.drop_duplicates(subset=['route_id', 'date'], keep='last', inplace=True)
+                after_dedup = len(df_combined)
+                
+                if before_dedup > after_dedup:
+                    logger.info(f"Menghapus {before_dedup - after_dedup} baris duplikat (mengupdate data terbaru).")
+                
+                # 6. Simpan kembali (Overwrite file dengan data gabungan)
+                df_combined.to_csv(CSV_PATH, index=False)
+                logger.info(f"SUCCESS: Data digabungkan dan disimpan. Total baris: {len(df_combined)}")
+                
+            else:
+                # Jika file belum ada, buat baru
+                logger.info(f"File belum ada. Membuat '{CSV_FILENAME}' baru...")
+                df_new.to_csv(CSV_PATH, index=False)
+                logger.info(f"SUCCESS: File baru disimpan. Total baris: {len(df_new)}")
+
+        except Exception as e:
+            logger.critical(f"GAGAL menyimpan CSV: {e}")
+    else:
+        logger.warning("Tidak ada data baru untuk disimpan.")
+
+    logger.info("--- END PROCESS ---")
+
+if __name__ == "__main__":
+    main()
