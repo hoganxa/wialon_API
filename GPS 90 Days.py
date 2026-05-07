@@ -1,6 +1,6 @@
 # wialon_API
 # fetching drivers' login time based on Truck's GPS using Wialon API
-# connect the data with database / cloud
+# connect the data with database / cloud TO GET TOKEN NUMBER stored in DB
 
 import pymysql
 import pandas as pd
