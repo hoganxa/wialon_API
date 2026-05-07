@@ -20,16 +20,16 @@ DB_NAME = 'XXXXX'
 WIALON_API_URL = 'https://hst-api.wialon.com/wialon/ajax.html'
 API_TOKEN = 'TOKEN NUMBER HERE'
 # --- Pengaturan Folder Output ---
-BASE_DIR = r"G:\Reports\106_Route_Earnings"
-CSV_FILENAME = "to check.csv"
+BASE_DIR = r"G:\path\to\directory"
+CSV_FILENAME = "documentname.csv"
 LOG_FILENAME = "logs.txt"
 
 CSV_PATH = os.path.join(BASE_DIR, CSV_FILENAME)
 LOG_PATH = os.path.join(BASE_DIR, LOG_FILENAME)
 
-# --- [ AKHIR KONFIGURASI ] ---
+# --- [ END OF CONFIGURATION ] ---
 
-# --- FUNGSI SETUP LOGGING ---
+# --- SETUP LOGGING ---
 def setup_logging():
     if not os.path.exists(BASE_DIR):
         try: os.makedirs(BASE_DIR)
@@ -46,7 +46,7 @@ def setup_logging():
     sh = logging.StreamHandler(); sh.setFormatter(formatter); logger.addHandler(sh)
     return logger
 
-# --- FUNGSI UTILITIES ---
+# --- UTILITIES ---
 def format_timestamp(ts):
     """Mengubah Unix timestamp menjadi string waktu."""
     if not ts: return None
@@ -61,7 +61,7 @@ def wialon_request(svc, params, sid=None):
         return response.json()
     except Exception as e: return {"error": str(e)}
 
-# --- FUNGSI IDENTIFIKASI KENDARAAN ---
+# --- VEHICLE IDENTIFICATION ---
 def extract_identity(car_name):
     if not car_name: return None, None
     clean_name = re.sub(r'\(.*?\)', '', str(car_name)) 
@@ -87,39 +87,17 @@ def find_match_by_identity(db_car_name, wialon_name_map):
             return unit_id, wialon_name, "Identity Match (Brand+Reg)"
     return None, None, "No Match"
 
-# --- FUNGSI DATABASE ---
+# --- DATABASE OPTIONAL ---
 def get_route_data_from_db(logger):
     sql_query = """
     SELECT 
-        r.id AS route_id, 
-        r.deleted,
-        r.name AS route_name, 
-        c.name AS car_name, 
-        r.start_warehouse_id,
-        r.start_date,
-        r.driver_amt AS driver_amount,
-        rd.driver_username, 
-        rd.is_helper, 
-        e.name AS driver_name, 
-        e.name2 AS driver_name2,
-        w.name AS warehouse_name,
-        c.id AS car_id,
-        c.wialon_tracking_imei
+        XXXXX
     FROM 
-        route r
+        XXXXX
     LEFT JOIN 
-        route_driver rd ON r.id = rd.route_id
-    LEFT JOIN 
-        employee e ON rd.driver_username = e.username 
-    LEFT JOIN 
-        warehouse w ON r.start_warehouse_id = w.warehouse_id
-    LEFT JOIN 
-        cars c ON r.car_id = c.id
-    WHERE
-        c.wialon_tracking_imei IS NOT NULL
-    AND r.start_date BETWEEN '2025-09-16' AND '2025-11-30';
+        XXXXX
     """
-    logger.info("Mengambil data rute dari database MySQL...")
+    logger.info("Fetching rote data from database MySQL...")
     try:
         connection = pymysql.connect(
             host=DB_HOST, user=DB_USER, password=DB_PASSWORD, database=DB_NAME,
@@ -136,7 +114,7 @@ def get_route_data_from_db(logger):
         return pd.DataFrame()
 
 def build_wialon_name_map(sid, logger):
-    logger.info("Membangun peta Nama Unit Wialon...")
+    logger.info("Building map Unit Wialon...")
     name_map = {}
     params = {"spec": {"itemsType": "avl_unit", "propName": "sys_name", "propValueMask": "*", "sortType": "sys_name"}, "force": 1, "flags": 1, "from": 0, "to": 0}
     resp = wialon_request("core/search_items", params, sid)
@@ -145,7 +123,7 @@ def build_wialon_name_map(sid, logger):
             if unit.get('nm'): name_map[unit['nm']] = unit['id']
         return name_map
     else:
-        logger.error("Gagal ambil unit Wialon.")
+        logger.error("Failed to get Wialon Unit.")
         return None
 
 # --- MAIN LOGIC ---
@@ -156,7 +134,7 @@ def main():
     # 1. Login
     login = wialon_request("token/login", {"token": API_TOKEN})
     if 'eid' not in login: 
-        logger.critical(f"Login Gagal: {login}")
+        logger.critical(f"Login failed: {login}")
         return
     sid = login['eid']
 
@@ -169,7 +147,7 @@ def main():
         logger.warning("No route data found in the database.")
         return
 
-    logger.info(f"Memproses data dan menyusun CSV ({CSV_FILENAME})...")
+    logger.info(f"Processing data and arranging to CSV ({CSV_FILENAME})...")
 
     csv_data = []
 
@@ -196,7 +174,7 @@ def main():
         car_name = route['car_name']
         date_obj = route['start_date']
 
-        # A. Pencocokan Unit
+        # A. Matching Unit
         unit_id, matched_name, match_type = find_match_by_identity(car_name, name_map)
         
         if not unit_id:
@@ -204,7 +182,7 @@ def main():
             csv_data.append(result_base)
             continue
 
-        # B. Validasi Tanggal
+        # B. Date Validation
         try:
             if not isinstance(date_obj, datetime): date_obj = pd.to_datetime(date_obj)
             t_from = int(date_obj.replace(hour=0, minute=0, second=0).timestamp())
@@ -252,55 +230,43 @@ def main():
 
     # --- Save CSV (APPEND MODE LOGIC) ---
     if csv_data:
-        # 1. Buat DataFrame dari data BARU
         df_new = pd.DataFrame(csv_data)
-        
-        # Definisi kolom output
         cols = [
             "route_id", "route_name", "car_name", "date", "driver_amount", 
             "driver_username", "is_helper", "driver_name", "driver_name2", 
             "warehouse_name", "car_id", "tracking_imei", 
             "start_time", "end_time", "data_source"
         ]
-        
-        # Filter kolom agar sesuai
         final_cols = [c for c in cols if c in df_new.columns]
         df_new = df_new[final_cols]
 
         try:
-            # 2. Cek apakah file sudah ada
-            if os.path.exists(CSV_PATH):
-                logger.info(f"File '{CSV_FILENAME}' ditemukan. Menggabungkan data baru...")
+           if os.path.exists(CSV_PATH):
+                logger.info(f"File '{CSV_FILENAME}' found. COmbining new data...")
                 
-                # 3. Baca file lama
                 df_existing = pd.read_csv(CSV_PATH)
-                
-                # 4. Gabungkan data lama dan baru
                 df_combined = pd.concat([df_existing, df_new], ignore_index=True)
                 
-                # 5. Hapus duplikat (Untuk mencegah data ganda jika script dijalankan ulang untuk hari yang sama)
-                # Kita anggap 'route_id' dan 'date' sebagai kunci unik
+                # 5. Remove duplicate considering 'route_id' and 'date' as unique key
                 before_dedup = len(df_combined)
                 df_combined.drop_duplicates(subset=['route_id', 'date'], keep='last', inplace=True)
                 after_dedup = len(df_combined)
                 
                 if before_dedup > after_dedup:
-                    logger.info(f"Menghapus {before_dedup - after_dedup} baris duplikat (mengupdate data terbaru).")
+                    logger.info(f"Erasing {before_dedup - after_dedup} duplicate rows (mengupdate data terbaru).")
                 
-                # 6. Simpan kembali (Overwrite file dengan data gabungan)
                 df_combined.to_csv(CSV_PATH, index=False)
                 logger.info(f"SUCCESS: Data digabungkan dan disimpan. Total baris: {len(df_combined)}")
                 
             else:
-                # Jika file belum ada, buat baru
-                logger.info(f"File belum ada. Membuat '{CSV_FILENAME}' baru...")
+                logger.info(f"Creating new file of '{CSV_FILENAME}' ...")
                 df_new.to_csv(CSV_PATH, index=False)
-                logger.info(f"SUCCESS: File baru disimpan. Total baris: {len(df_new)}")
+                logger.info(f"SUCCESS: New file saved. Total rows: {len(df_new)}")
 
         except Exception as e:
-            logger.critical(f"GAGAL menyimpan CSV: {e}")
+            logger.critical(f"Failed saving CSV: {e}")
     else:
-        logger.warning("Tidak ada data baru untuk disimpan.")
+        logger.warning("No new data to be saved.")
 
     logger.info("--- END PROCESS ---")
 
